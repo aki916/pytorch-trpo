@@ -5,8 +5,6 @@ import time
 
 import gym
 import scipy.optimize
-import imageio
-import matplotlib.pyplot as plt
 import numpy as np
 
 import torch
@@ -16,6 +14,7 @@ from running_state import ZFilter
 from torch.autograd import Variable
 from trpo import trpo_step
 from utils import *
+from gif_recorder import save_episode_gif, plot_rewards, setup_gif_recording
 
 torch.utils.backcompat.broadcast_warning.enabled = True
 torch.utils.backcompat.keepdim_warning.enabled = True
@@ -164,109 +163,12 @@ def update_params(batch):
 running_state = ZFilter((num_inputs,), clip=5)
 running_reward = ZFilter((1,), demean=False, clip=10)
 
-# GIF保存用のディレクトリを作成
-os.makedirs(args.output_dir, exist_ok=True)
+# GIF保存用のディレクトリを設定
+setup_gif_recording(args.output_dir)
 
 # 報酬履歴を保存するリスト
 reward_history = []
 episode_history = []
-
-def plot_rewards(episodes, rewards, output_dir):
-    """報酬の履歴をプロットして保存する関数"""
-    plt.figure(figsize=(12, 6))
-    plt.plot(episodes, rewards, 'b-', alpha=0.6, linewidth=1)
-    
-    # 移動平均を計算して表示
-    if len(rewards) > 10:
-        window = min(10, len(rewards) // 10)
-        moving_avg = np.convolve(rewards, np.ones(window)/window, mode='valid')
-        plt.plot(episodes[window-1:], moving_avg, 'r-', linewidth=2, label=f'移動平均 (window={window})')
-        plt.legend()
-    
-    plt.xlabel('エピソード')
-    plt.ylabel('平均報酬')
-    plt.title('TRPO学習の進捗')
-    plt.grid(True, alpha=0.3)
-    
-    # プロットを保存
-    plot_filename = os.path.join(output_dir, 'reward_progress.png')
-    plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f'報酬プロット保存: {plot_filename}')
-
-def record_episode(env, policy_net, running_state, max_steps=1000):
-    """エピソードを録画してGIFとして保存する関数"""
-    frames = []
-    reset_result = env.reset(seed=args.seed)
-    if isinstance(reset_result, tuple):
-        state, _ = reset_result
-    else:
-        state = reset_result
-    state = running_state(state)
-    
-    # 環境の種類を検出
-    env_type = type(env).__name__
-    print(f"環境タイプ: {env_type}")
-    
-    def render_frame():
-        """環境に応じた適切なレンダリング方法を選択"""
-        try:
-            # 新しいgymバージョン用
-            frame = env.render(mode='rgb_array')
-            if frame is None:
-                raise ValueError("render() returned None")
-            return frame
-        except (TypeError, ValueError):
-            try:
-                # 古いgymバージョン用
-                frame = env.render()
-                if frame is None:
-                    raise ValueError("render() returned None")
-                return frame
-            except Exception as e:
-                # レンダリングできない場合はダミーフレームを作成
-                print(f"Warning: 環境のレンダリングに失敗しました: {e}")
-                frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                # テキストを描画
-                try:
-                    import cv2
-                    cv2.putText(frame, f"Episode {len(frames)}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-                    cv2.putText(frame, f"Env: {args.env_name}", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                    cv2.putText(frame, f"Step: {len(frames)}", (50, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                except ImportError:
-                    # cv2がない場合はnumpyでテキストを描画
-                    frame[50:80, 50:200] = [255, 255, 255]  # 白い四角を描画
-                return frame
-    
-    for step in range(max_steps):
-        # 環境をレンダリングしてフレームを取得
-        frame = render_frame()
-        frames.append(frame)
-        
-        # アクションを選択
-        action = select_action(state)
-        action = action.data[0].numpy()
-        step_result = env.step(action)
-        
-        if len(step_result) == 5:
-            next_state, reward, done, truncated, _ = step_result
-            episode_done = done or truncated
-        else:
-            next_state, reward, done, _ = step_result
-            episode_done = done
-            
-        next_state = running_state(next_state)
-        
-        if episode_done:
-            # 最後のフレームを追加
-            final_frame = render_frame()
-            frames.append(final_frame)
-            break
-            
-        state = next_state
-    
-    print(f"録画完了: {len(frames)} フレーム")
-    return frames
 
 for i_episode in count(1):
     memory = Memory()
@@ -325,34 +227,8 @@ for i_episode in count(1):
 
     # 定期的にGIFを保存
     if i_episode % args.save_gif_interval == 0:
-        print(f'Recording episode {i_episode} for GIF...')
-        try:
-            frames = record_episode(env, policy_net, running_state)
-            
-            # フレームの妥当性をチェック
-            valid_frames = []
-            for i, frame in enumerate(frames):
-                if frame is not None and hasattr(frame, '__array_interface__'):
-                    valid_frames.append(frame)
-                else:
-                    print(f"Warning: 無効なフレーム {i} をスキップ")
-            
-            if len(valid_frames) > 0:
-                # GIFファイル名を生成
-                gif_filename = os.path.join(args.output_dir, f'episode_{i_episode:06d}_reward_{reward_batch:.2f}.gif')
-                
-                # フレームレートを計算（指定された時間に合わせる）
-                fps = max(1, len(valid_frames) / args.gif_duration)
-                
-                # GIFを保存
-                imageio.mimsave(gif_filename, valid_frames, fps=fps)
-                print(f'GIF saved: {gif_filename} ({len(valid_frames)} frames, {fps:.1f} fps)')
-            else:
-                print("Warning: 有効なフレームがありません")
-                
-        except Exception as e:
-            print(f"Error saving GIF: {e}")
-            print("GIF保存をスキップします")
+        save_episode_gif(env, policy_net, running_state, i_episode, reward_batch, 
+                        args.output_dir, args.env_name, args.seed, select_action, args.gif_duration)
 
     # 定期的に報酬プロットを更新
     if i_episode % args.plot_interval == 0:
